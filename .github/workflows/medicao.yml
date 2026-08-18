@@ -167,11 +167,32 @@ jobs:
             echo "ℹ️  exit_codes_run_00.txt movido junto (par CSV+sidecar preservado)"
           fi
 
+          # ─── V1: RUN REJEITADA POR EXIT CODE (exit 65) ──────────────────────
+          # Desfecho DIFERENTE de falha de medição, e precisa ser tratado ANTES
+          # dela: quando o run_pipeline.sh rejeita a run, ele move o CSV para
+          # runs/descartados_exit_code/ de propósito, então o caminho oficial
+          # fica vazio — e o `validar_csv` abaixo, sozinho, reportaria isso como
+          # "falha de medição", que é a causa errada. A medição funcionou; o
+          # workload é que não saiu na lista declarada {0}.
+          if [ "$PIPELINE_EXIT" -eq 65 ]; then
+            echo "::error title=Run rejeitada por exit code::run 0: um stage saiu com codigo fora da lista DECLARADA {0} para o django (revisao_metodologica.md §E.5/E.11). A medicao funcionou — o CSV e o sidecar estao preservados em runs/descartados_exit_code/, fora do caminho oficial, para que o aggregate.py nao os alcance. A VALIDACAO FALHOU: nao dispare a campanha completa antes de investigar. Detalhe por stage no sidecar e log completo em resultados/django/logs/."
+            {
+              echo ""
+              echo "### ⛔ Validação REPROVADA — run rejeitada por exit code"
+              echo ""
+              echo "A run 0 saiu com \`exit=65\`: algum stage retornou código fora da lista declarada \`{0}\`."
+              echo "O CSV **não** está no caminho oficial — está em \`runs/descartados_exit_code/\`."
+              echo ""
+              echo "**Não dispare \`campaign=completa\`** antes de investigar."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
           # ─── GATE DE MEDIÇÃO ────────────────────────────────────────────────
-          # É AQUI que o job pode falhar, e só aqui: CSV ausente, malformado, ou
-          # energia/wall zerados — container que não subiu, RAPL ilegível,
-          # escrita interrompida. Falha de MEDIÇÃO. O exit code do workload não
-          # entra nesta decisão.
+          # É AQUI que o job pode falhar por MEDIÇÃO: CSV ausente, malformado,
+          # ou energia/wall zerados — container que não subiu, RAPL ilegível,
+          # escrita interrompida. O exit code do workload não entra nesta
+          # decisão (ele já foi tratado no bloco acima).
           if ! validar_csv "$RESULTS_DIR/validacao/run_00.csv"; then
             echo "::error title=Falha de medição::run 0: CSV ausente ou inválido em runs/validacao/run_00.csv (pipeline exit=$PIPELINE_EXIT). Energia e/ou wall não foram medidos — isto NÃO é a falha esperada do workload."
             exit 1
@@ -324,6 +345,15 @@ jobs:
               mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
                     "$RESULTS_DIR/warmup/exit_codes_run_warmup.txt"
             fi
+            # V1: warm-up rejeitado por exit code aborta a campanha. Ele é
+            # descartado da análise de qualquer forma, mas um exit 65 aqui
+            # significa que o workload não produz {0} nesta sessão — seguir
+            # gastaria ~1,6 h para produzir 10 runs igualmente rejeitáveis.
+            if [ "$WARMUP_EXIT" -eq 65 ]; then
+              echo "::error title=Warm-up rejeitado por exit code::warm-up: um stage saiu com codigo fora da lista DECLARADA {0}. A campanha NAO prossegue: o workload nao esta produzindo o resultado declarado nesta sessao. Material em runs/descartados_exit_code/."
+              echo "- **Warm-up REJEITADO por exit code** — campanha abortada" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
             if [ "$WARMUP_EXIT" -ne 0 ]; then
               echo "::warning title=Exit code fora do esperado::warm-up: run_pipeline.sh saiu com exit=$WARMUP_EXIT; o esperado no django e 0. O warm-up e descartado da analise de qualquer forma."
             fi
@@ -369,6 +399,25 @@ jobs:
             echo "$NN,$T_INI,$(agora_utc),$RUN_EXIT,campanha" >> "$ORDEM"
             alertar_user_sys "$CSV" "run $NN"
             alertar_swap "$CSV" "run $NN"
+            # ─── V1: run rejeitada por exit code ─────────────────────────────
+            # Tratado ANTES do gate de medição, pelo mesmo motivo do modo
+            # validacao: o CSV foi movido de propósito para descartados_exit_code/,
+            # então o caminho oficial está vazio e o validar_csv atribuiria a
+            # causa errada. A run NÃO consome número: `run_NN.csv` continua
+            # inexistente, o aggregate.py nunca a vê, e a pré-condição do step
+            # de medianas continuaria falhando mesmo que se prosseguisse.
+            #
+            # A campanha ABORTA em vez de repor automaticamente. Com {0}
+            # declarado e teste local verde, um exit fora da lista é regressão
+            # sistemática, não ruído: repor sozinho giraria 10 vezes no mesmo
+            # erro. A reposição da §E.4 é decisão humana, depois de investigar.
+            if [ "$RUN_EXIT" -eq 65 ]; then
+              echo "::error title=Run $NN rejeitada por exit code::run $NN: um stage saiu com codigo fora da lista DECLARADA {0} (revisao_metodologica.md §E.5/E.11). A run foi descartada e NAO consome numero: runs/run_$NN.csv nao existe, e o aggregate.py nao pode media-la. Material preservado em runs/descartados_exit_code/. Campanha ABORTADA — a reposicao (§E.4) e decisao humana, apos investigar."
+              {
+                echo "- Run $NN: **REJEITADA por exit code** — descartada para \`runs/descartados_exit_code/\`, número NÃO consumido, campanha abortada"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
             if ! validar_csv "$CSV"; then
               echo "::error title=Falha de medição::run $NN: CSV ausente ou inválido após o pipeline (exit=$RUN_EXIT). Energia e/ou wall não foram medidos — campanha abortada."
               echo "- Run $NN: **FALHA DE MEDIÇÃO** (pipeline exit=$RUN_EXIT) — campanha abortada" >> "$GITHUB_STEP_SUMMARY"
