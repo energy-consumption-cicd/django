@@ -1,0 +1,443 @@
+name: Medição de Energia — django
+
+# Opção C: workflow dedicado que invoca o run_pipeline.sh da tesla, rodando no
+# self-hosted runner. Não substitui nem altera nenhum workflow do django.
+# ÚNICO ARQUIVO TOCADO NO FORK.
+#
+# Célula de referência espelhada: job `ubuntu-free-threading` de
+# `.github/workflows/tests.yml`, nome "Ubuntu, SQLite, Python 3.14t".
+# É o ÚNICO job Linux/Python que dispara incondicionalmente em `push: main` e
+# `pull_request`; as matrizes de PostgreSQL/MySQL/Oracle, Selenium, GeoDjango e
+# de versões CPython vivem em workflows gated por label ou em
+# `schedule_tests.yml` e aparecem `skipped` nas runs de referência — mesmo
+# critério que excluiu o `unittests-extended` no torchvision.
+# Commit congelado: be6cf832293779d8aeaeddca8c47a37ba1530898
+#
+# STAGES: build + test. NÃO existe `train` — o django não é projeto de ML.
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "validacao = apenas run 0 (smoke test) | completa = warm-up + runs 1..10 + mediana"
+        type: choice
+        required: true
+        default: validacao
+        options:
+          - validacao
+          - completa
+
+jobs:
+  medicao:
+    runs-on: [self-hosted, linux]
+    env:
+      # O contexto `env` do Actions não expõe o HOME do processo do runner: a
+      # interpolação resolvia para string vazia e o upload-artifact não achava
+      # nada. NUNCA usar ${{ env.HOME }} (bug já corrigido em PL e VW).
+      HOME_DIR: /home/maycon
+    # Por run: baseline 120s + build ~17s + test ~207s + overhead ≈ 6 min.
+    # Campanha completa ≈ warm-up + 10 runs + repousos ≈ 1,6 h. Folga larga.
+    timeout-minutes: 600
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+        with:
+          submodules: false   # projeto já está inteiro na imagem Docker
+
+      - name: Permitir leitura dos contadores RAPL
+        run: sudo /usr/local/bin/rapl-set-readable
+
+      - name: Verificar disponibilidade do RAPL
+        run: |
+          if [ ! -d /sys/class/powercap/intel-rapl ]; then
+            echo "❌ RAPL não disponível neste runner"
+            exit 1
+          fi
+          echo "✅ Domínios RAPL disponíveis:"
+          ls /sys/class/powercap/intel-rapl/
+
+      - name: Verificar imagem Docker
+        run: |
+          if ! docker image inspect django-medicao &>/dev/null; then
+            echo "❌ Imagem 'django-medicao' não encontrada no runner."
+            echo "   Build manual na tesla antes de disparar este workflow:"
+            echo "   docker build -t django-medicao \\"
+            echo "     -f ~/experimentos/medicao/repositorios/django/Dockerfile \\"
+            echo "     ~/experimentos/repositorios/nao-ml/django/"
+            exit 1
+          fi
+          echo "✅ Imagem Docker encontrada."
+          docker image inspect django-medicao --format '{{.Created}}'
+
+          # Os três GATEs abaixo são os MESMOS do run_pipeline.sh, duplicados de
+          # propósito: aqui eles falham o JOB antes de qualquer medição começar.
+          # Todos são FUNCIONAIS — executam o que precisa funcionar. Gate
+          # estrutural (arquivo existe) não é gate; foi o modo de falha do sktime.
+
+          # GATE 1 — django funcional sob as settings de teste.
+          if ! docker run --rm --network none -w /project/tests \
+                 -e DJANGO_SETTINGS_MODULE=test_sqlite django-medicao \
+                 python -c "import django; django.setup(); from django.conf import settings; assert settings.DATABASES['default']['ENGINE'].endswith('sqlite3')"; then
+            echo "❌ Na imagem o django não completa django.setup() sob test_sqlite."
+            echo "   O stage 'test' falharia depois de a medição começar. Reconstrua."
+            exit 1
+          fi
+          echo "✅ GATE 1: django.setup() completo, backend sqlite3."
+
+          # GATE 2 — interpretador free-threaded (SEM GIL). Se a imagem trouxesse
+          # um build com GIL, mediríamos outra célula e nada perceberia.
+          if ! docker run --rm --network none django-medicao \
+                 python -c "import sys; assert not sys._is_gil_enabled()"; then
+            echo "❌ A imagem NÃO tem CPython free-threaded (GIL está ativo)."
+            echo "   A célula de referência é 'Ubuntu, SQLite, Python 3.14t'."
+            exit 1
+          fi
+          echo "✅ GATE 2: CPython 3.14t free-threaded, GIL desativado."
+
+          # GATE 3 — wheelhouse resolve OFFLINE, nas mesmas condições do `build`.
+          # `--ignore-installed` é OBRIGATÓRIO: sem ele o --dry-run responde
+          # "Requirement already satisfied" para tudo (o /venv da imagem já tem
+          # os 55 pacotes) e o gate aprova um wheelhouse incompleto. Descoberto
+          # no teste local de 2026-08-18, com numpy e Pillow removidos de
+          # propósito: o gate passou e os DOIS stages falharam depois.
+          if ! docker run --rm --network none -w /project django-medicao \
+                 pip install --dry-run --ignore-installed --quiet --no-index \
+                 --find-links=/wheelhouse -r tests/requirements/py3-free-threading.txt; then
+            echo "❌ O /wheelhouse da imagem não resolve offline."
+            echo "   O stage 'build' falharia sob --network none. Reconstrua."
+            exit 1
+          fi
+          echo "✅ GATE 3: wheelhouse resolve offline (55 wheels binárias)."
+
+      # --- MODO validacao: apenas run 0, resultado não conta para a mediana ---
+      - name: Run de validação (run 0)
+        if: ${{ inputs.campaign == 'validacao' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/django/runs"
+
+          # Cópia LITERAL da validar_csv do step "Executar 10 runs de medição".
+          # Duplicada de propósito: cada `run:` do Actions é um shell próprio e
+          # funções não atravessam steps. Se uma mudar, a outra tem de mudar junto.
+          validar_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          # D-8: FALHA DO WORKLOAD ≠ FALHA DA MEDIÇÃO. `|| PIPELINE_EXIT=$?`
+          # captura o código SEM engolir — ele é testado abaixo e vira
+          # ::warning::. Sem isto, o `bash -e` mataria o step e levaria junto o
+          # `mv` e os sanity checks (job 92987000108 do orange3).
+          PIPELINE_EXIT=0
+          bash "$HOME/experimentos/medicao/repositorios/django/run_pipeline.sh" 0 \
+            || PIPELINE_EXIT=$?
+
+          # run 0 é smoke test: sai de runs/ para não entrar na agregação da
+          # mediana (aggregate.py globa runs/run_*.csv).
+          #
+          # O CSV e o exit_codes_run_00.txt são um PAR. Nos seis projetos do
+          # estudo o `mv` levava só o CSV, e a run 00 seguinte sobrescrevia o
+          # sidecar — perdendo a evidência de exit code, que é o artefato de que
+          # a regra §E depende. O torchvision já nasceu corrigido; o django
+          # herda a correção.
+          mkdir -p "$RESULTS_DIR/validacao"
+          if [ -f "$RESULTS_DIR/run_00.csv" ]; then
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/validacao/run_00.csv"
+            echo "ℹ️  run_00.csv movido para runs/validacao/ (não conta para os resultados)"
+          fi
+          if [ -f "$RESULTS_DIR/exit_codes_run_00.txt" ]; then
+            mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
+                  "$RESULTS_DIR/validacao/exit_codes_run_00.txt"
+            echo "ℹ️  exit_codes_run_00.txt movido junto (par CSV+sidecar preservado)"
+          fi
+
+          # ─── GATE DE MEDIÇÃO ────────────────────────────────────────────────
+          # É AQUI que o job pode falhar, e só aqui: CSV ausente, malformado, ou
+          # energia/wall zerados — container que não subiu, RAPL ilegível,
+          # escrita interrompida. Falha de MEDIÇÃO. O exit code do workload não
+          # entra nesta decisão.
+          if ! validar_csv "$RESULTS_DIR/validacao/run_00.csv"; then
+            echo "::error title=Falha de medição::run 0: CSV ausente ou inválido em runs/validacao/run_00.csv (pipeline exit=$PIPELINE_EXIT). Energia e/ou wall não foram medidos — isto NÃO é a falha esperada do workload."
+            exit 1
+          fi
+          if [ "$PIPELINE_EXIT" -ne 0 ]; then
+            echo "::warning title=Exit code fora do esperado::run 0: run_pipeline.sh saiu com exit=$PIPELINE_EXIT, mas a lista DECLARADA para o django e {0} em ambos os stages. O que sustenta: o commands.sh chama runtests.py DIRETAMENTE (sem wrapper), entao o exit code e o do unittest; a run de referencia do upstream (32049994393) fecha verde com 19750 testes e OK (skipped=1496, expected failures=4); e o teste local de 2026-08-18 fechou 19750 testes, OK (skipped=1495, expected failures=4), exit 0 nos dois stages. Codigos por stage em runs/validacao/exit_codes_run_00.txt."
+          fi
+          echo "✅ run 0: medição válida (exit do workload=$PIPELINE_EXIT)"
+
+          # Sanity check não bloqueante de captura de CPU (ver alertar_user_sys
+          # no modo completa). FONTE: coluna 14 (cpu_time_cgroup_s) quando > 0.
+          awk -F, '
+            NR==1 { next }
+            ($2=="build" || $2=="test") && $7+0 > 0 {
+              if (NF >= 14 && $14+0 > 0) { cpu = $14+0; fonte = "cpu_time_cgroup_s" }
+              else                       { cpu = $8+$9; fonte = "user+sys (fallback)" }
+              r = cpu / $7
+              if (r < 0.5)
+                printf "::warning::[run 0] stage %s: cpu/wall = %.4f < 0.5 (cpu=%ss wall=%ss, fonte: %s) — esperado no django: ~0,99 no build e ~4,11 no test\n", $2, r, cpu, $7, fonte
+            }
+          ' "$RESULTS_DIR/validacao/run_00.csv"
+          # Sanity check não bloqueante de paginação.
+          awk -F, -v LIMIAR="${SWAP_WARN_PAGES:-256}" '
+            NR==1 { next }
+            NF >= 13 && ($2=="build" || $2=="test") && $13+0 > LIMIAR {
+              printf "::warning::[run 0] stage %s: swap_out_pages=%s (swap_in_pages=%s, limiar %s) — houve paginação do host durante a janela medida; run suspeita por contenção de I/O\n", $2, $13, $12, LIMIAR
+            }
+          ' "$RESULTS_DIR/validacao/run_00.csv"
+
+      # --- MODO completa: 10 runs oficiais + mediana (com skip-if-exists) ---
+      - name: Executar 10 runs de medição
+        if: ${{ inputs.campaign == 'completa' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/django/runs"
+          PIPELINE="$HOME/experimentos/medicao/repositorios/django/run_pipeline.sh"
+          # Garantir que nenhum run_00.csv de validação polua a mediana
+          rm -f "$RESULTS_DIR/run_00.csv"
+
+          # ─── PROVENIÊNCIA TEMPORAL (2026-08-11) ─────────────────────────────
+          # Registra a ORDEM REAL de execução, que o conjunto final não preserva
+          # sozinho: pela regra E.4, uma run rejeitada é reposta reexecutando o
+          # MESMO número, então `run_03` pode ter sido a última a rodar.
+          # APPEND-ONLY. O nome não casa com o glob `run_*.csv` do aggregate.py.
+          ORDEM="$RESULTS_DIR/ordem_execucao.txt"
+          if [ ! -f "$ORDEM" ]; then
+            echo "# ordem real de execução (append-only) — run,inicio_utc,fim_utc,exit,origem" > "$ORDEM"
+          fi
+          agora_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+          validar_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          # ─── Sanity check NÃO bloqueante de captura de CPU ──────────────────
+          #
+          # ⚠️  A SEMÂNTICA AQUI É DIFERENTE DA DOS SEIS PROJETOS ANTERIORES.
+          # Não copie a leitura de lá.
+          #
+          # A FONTE mudou. Regra fixada em `convencao_medicao_yml.md` §6
+          # (2026-08-18): lê `cpu_time_cgroup_s` (coluna 14) quando existe e é
+          # > 0, e cai para `user_time_s + sys_time_s` quando não existe.
+          #
+          # POR QUÊ. O `test` do django roda `runtests.py` com 8 workers, e o
+          # CPython 3.14 usa `start_method=forkserver` por default no Linux. Com
+          # forkserver o worker é filho do DAEMON forkserver, não do processo
+          # cronometrado, e o `join()` lê um sentinel fd em vez de fazer
+          # `waitpid` — o RUSAGE_CHILDREN que o fd3 lê NUNCA os alcança. Medido:
+          # fd3 reportou 38,20 s contra 849,79 s reais do cgroup, fator ~22x.
+          # Com a fonte ERRADA o `test` daria 0,185 e dispararia em TODA run.
+          #
+          # `user_time_s`/`sys_time_s` permanecem no CSV, intactas: a
+          # comparabilidade com as seis campanhas fechadas depende de elas
+          # continuarem sendo o mesmo instrumento. A NOTA_FIDELIDADE declara que
+          # para o `test` do django são elas que estão erradas.
+          #
+          # Razões esperadas com a fonte correta (recon 2026-08-18):
+          #     build  ~0,99   (venv do zero + 55 wheels, monoprocesso)
+          #     test   ~4,11   (8 workers; CPU 849,8 s sobre wall 206,9 s)
+          # Alerta aqui é sinal REAL: ou a captura do cgroup regrediu, ou o
+          # stage não executou o trabalho esperado. Investigar, não ignorar.
+          alertar_user_sys() {
+            local csv="$1" origem="$2"
+            [ -f "$csv" ] || return 0
+            awk -F, -v origem="$origem" '
+              NR==1 { next }
+              ($2=="build" || $2=="test") && $7+0 > 0 {
+                if (NF >= 14 && $14+0 > 0) { cpu = $14+0; fonte = "cpu_time_cgroup_s" }
+                else                       { cpu = $8+$9; fonte = "user+sys (fallback)" }
+                r = cpu / $7
+                if (r < 0.5)
+                  printf "::warning::[%s] stage %s: cpu/wall = %.4f < 0.5 (cpu=%ss wall=%ss, fonte: %s) — esperado no django: ~0,99 no build e ~4,11 no test\n", origem, $2, r, cpu, $7, fonte
+              }
+            ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          # Sanity check NÃO bloqueante de paginação (colunas 12/13).
+          # No django espera-se ZERO paginação: o pico medido do `test` é
+          # 3,77 GiB contra teto de 12g — 3,2x de folga. Sem o aninhamento que
+          # estourou o sktime, sem os 13,55 GiB do bloco pesado do torchvision.
+          alertar_swap() {
+            local csv="$1" origem="$2"
+            [ -f "$csv" ] || return 0
+            awk -F, -v origem="$origem" -v LIMIAR="${SWAP_WARN_PAGES:-256}" '
+              NR==1 { next }
+              NF >= 13 && ($2=="build" || $2=="test") && $13+0 > LIMIAR {
+                printf "::warning::[%s] stage %s: swap_out_pages=%s (swap_in_pages=%s, limiar %s) — houve paginação do host durante a janela medida; run suspeita por contenção de I/O\n", origem, $2, $13, $12, LIMIAR
+              }
+            ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          # --- Warm-up descartado (convenção: 11 runs, mediana sobre os 10 válidos) ---
+          PENDENTES=0
+          for i in $(seq 1 10); do
+            validar_csv "$RESULTS_DIR/run_$(printf '%02d' "$i").csv" || PENDENTES=$((PENDENTES+1))
+          done
+          if [ "$PENDENTES" -gt 0 ]; then
+            echo "::group::Warm-up (descartado da análise)"
+            echo "🔥 $PENDENTES run(s) pendente(s) — executando warm-up antes dos runs oficiais"
+            mkdir -p "$RESULTS_DIR/warmup"
+            WARMUP_EXIT=0
+            T_INI=$(agora_utc)
+            bash "$PIPELINE" 0 || WARMUP_EXIT=$?
+            echo "00,$T_INI,$(agora_utc),$WARMUP_EXIT,warmup" >> "$ORDEM"
+            if [ ! -f "$RESULTS_DIR/run_00.csv" ]; then
+              echo "::error title=Falha de medição::warm-up: run_pipeline.sh (exit=$WARMUP_EXIT) não escreveu run_00.csv — falha de medição, não do workload."
+              exit 1
+            fi
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/warmup/run_warmup.csv"
+            # O sidecar acompanha o CSV (par preservado).
+            if [ -f "$RESULTS_DIR/exit_codes_run_00.txt" ]; then
+              mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
+                    "$RESULTS_DIR/warmup/exit_codes_run_warmup.txt"
+            fi
+            if [ "$WARMUP_EXIT" -ne 0 ]; then
+              echo "::warning title=Exit code fora do esperado::warm-up: run_pipeline.sh saiu com exit=$WARMUP_EXIT; o esperado no django e 0. O warm-up e descartado da analise de qualquer forma."
+            fi
+            alertar_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+            alertar_swap "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+            {
+              echo "## Warm-up executado e DESCARTADO (não entra na mediana)"
+              echo "- $PENDENTES run(s) pendente(s) nesta sessão; CSV em \`runs/warmup/run_warmup.csv\` (sobrescrito a cada sessão)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            echo "⏳ Repouso pós-warm-up (120s)..."
+            sleep 120
+          else
+            echo "✅ Campanha já completa (10 runs válidas) — warm-up desnecessário"
+            echo "## Warm-up pulado — campanha já estava completa" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "## Execução (modo completa) — skip-if-exists" >> "$GITHUB_STEP_SUMMARY"
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            CSV="$RESULTS_DIR/run_${NN}.csv"
+            echo "::group::Run $i de 10"
+            if validar_csv "$CSV"; then
+              echo "✅ Run $NN já existe e é válida — pulando"
+              echo "- Run $NN: já existe e é válida — **pulada**" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              continue
+            fi
+            if [ -f "$CSV" ]; then
+              echo "♻️  Run $NN incompleta/inválida — reexecutando (sobrescreve)"
+              echo "- Run $NN: CSV inválido/incompleto — **reexecutada**" >> "$GITHUB_STEP_SUMMARY"
+              rm -f "$CSV"
+            else
+              echo "▶️  Run $NN ausente — executando"
+              echo "- Run $NN: ausente — **executada**" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            # D-8: o loop TOLERA exit != 0 do workload. O código é capturado,
+            # não engolido: vira ::warning:: abaixo e fica registrado por stage
+            # no sidecar exit_codes_run_NN.txt.
+            RUN_EXIT=0
+            T_INI=$(agora_utc)
+            bash "$PIPELINE" "$i" || RUN_EXIT=$?
+            echo "$NN,$T_INI,$(agora_utc),$RUN_EXIT,campanha" >> "$ORDEM"
+            alertar_user_sys "$CSV" "run $NN"
+            alertar_swap "$CSV" "run $NN"
+            if ! validar_csv "$CSV"; then
+              echo "::error title=Falha de medição::run $NN: CSV ausente ou inválido após o pipeline (exit=$RUN_EXIT). Energia e/ou wall não foram medidos — campanha abortada."
+              echo "- Run $NN: **FALHA DE MEDIÇÃO** (pipeline exit=$RUN_EXIT) — campanha abortada" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if [ "$RUN_EXIT" -ne 0 ]; then
+              echo "::warning title=Exit code fora do esperado::run $NN: run_pipeline.sh saiu com exit=$RUN_EXIT, mas o esperado no django e 0 em ambos os stages. Pela regra congelada em revisao_metodologica.md secao E, esta run deve ser REJEITADA e REPOSTA. O CSV foi preservado e o aggregate.py ainda o contabiliza — a exclusao e MANUAL no pos-campanha. Codigos por stage em runs/exit_codes_run_$NN.txt; log completo do stage em resultados/django/logs/."
+              echo "- Run $NN: workload exit=$RUN_EXIT — **fora do esperado (0)**. Run a REJEITAR e REPOR; CSV preservado, exclusão manual (o aggregate.py ainda o conta)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::endgroup::"
+            if [ "$i" -lt 10 ]; then
+              echo "⏳ Repouso entre runs (120s)..."
+              sleep 120
+            fi
+          done
+
+          # Varredura final: cobre também runs pré-existentes puladas pelo skip-if-exists.
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            alertar_user_sys "$RESULTS_DIR/run_${NN}.csv" "run $NN"
+            alertar_swap "$RESULTS_DIR/run_${NN}.csv" "run $NN"
+          done
+
+          # ─── Pré-condição EXPLÍCITA do step de medianas ─────────────────────
+          # Sem isto, um CSV inválido numa run pulada pelo skip-if-exists
+          # chegaria ao aggregate.py e produziria mediana sobre menos de 10 runs.
+          INVALIDAS=""
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            validar_csv "$RESULTS_DIR/run_${NN}.csv" || INVALIDAS="${INVALIDAS:+$INVALIDAS }$NN"
+          done
+          if [ -n "$INVALIDAS" ]; then
+            echo "::error title=Campanha incompleta::runs com CSV ausente ou inválido: $INVALIDAS — as medianas NÃO serão calculadas."
+            echo "- **Campanha incompleta** — runs inválidas: $INVALIDAS" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "✅ 10 runs com CSV válido — pré-condição do aggregate.py satisfeita"
+
+      - name: Calcular medianas (após run 10)
+        if: ${{ inputs.campaign == 'completa' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/django/runs"
+          SUMMARY="$HOME/experimentos/medicao/resultados/django/summary.csv"
+          python3 "$HOME/experimentos/medicao/scripts/aggregate.py" "$RESULTS_DIR" "$SUMMARY"
+          {
+            echo ""
+            echo "## Medianas (10 runs) — django"
+            echo '```'
+            cat "$SUMMARY"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Docker --privileged grava arquivos como root no workspace; corrige o dono
+      # via container descartável (evita depender de sudo com senha no runner).
+      - name: Corrigir permissões do workspace
+        if: always()
+        run: |
+          docker run --rm --privileged \
+            -v "${{ github.workspace }}":/w \
+            alpine chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Upload dos resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultados-django-${{ github.run_number }}
+          # NOTA_FIDELIDADE.md é documento de consulta interna, local na tesla:
+          # fica fora do artefato.
+          path: |
+            ${{ env.HOME_DIR }}/experimentos/medicao/resultados/django/
+            !${{ env.HOME_DIR }}/experimentos/medicao/resultados/django/NOTA_FIDELIDADE.md
+          retention-days: 90
