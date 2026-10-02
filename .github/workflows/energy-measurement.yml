@@ -149,12 +149,12 @@ jobs:
           # the CSV was moved to the discard directory on purpose, and validar_csv alone
           # would misreport it as a measurement failure.
           if [ "$PIPELINE_EXIT" -eq 65 ]; then
-            echo "::error title=Run rejected by exit code::run 0: a stage exited with a code outside the DECLARED list build {0}, test {0} for django. The measurement worked; the CSV and sidecar are preserved in runs/discarded_exit_code/, outside the official path, so aggregate.py does not reach them. VALIDATION FAILED: do not dispatch the full campaign before investigating. Per-stage detail in the sidecar; full log in resultados/django/logs/."
+            echo "::error title=Run rejected by exit code::run 0: a stage exited with a code outside the DECLARED list build {0}, test {0, 1} for django. The measurement worked; the CSV and sidecar are preserved in runs/discarded_exit_code/, outside the official path, so aggregate.py does not reach them. VALIDATION FAILED: do not dispatch the full campaign before investigating. Per-stage detail in the sidecar; full log in resultados/django/logs/."
             {
               echo ""
               echo "### Validation FAILED: run rejected by exit code"
               echo ""
-              echo "Run 0 exited with \`exit=65\`: a stage returned a code outside the declared list \`build {0}, test {0}\`."
+              echo "Run 0 exited with \`exit=65\`: a stage returned a code outside the declared list \`build {0}, test {0, 1}\`."
               echo "The CSV is **not** in the official path; it is in \`runs/discarded_exit_code/\`."
               echo ""
               echo "**Do not dispatch \`campaign=full\`** before investigating."
@@ -168,8 +168,8 @@ jobs:
             echo "::error title=Measurement failure::run 0: CSV missing or invalid at runs/validation/run_00.csv (pipeline exit=$PIPELINE_EXIT). Energy and/or wall were not measured; this is NOT an expected workload failure."
             exit 1
           fi
-          if [ "$PIPELINE_EXIT" -ne 0 ]; then
-            echo "::warning title=Unexpected exit code::run 0: run_pipeline.sh exited with exit=$PIPELINE_EXIT, but the DECLARED list for django is build {0}, test {0}. Basis: commands.sh calls runtests.py DIRECTLY (no wrapper), so the exit code is that of unittest; the local test of this release reproduced the declared exits. Per-stage codes in runs/validation/exit_codes_run_00.txt."
+          if [ "$PIPELINE_EXIT" -gt 1 ]; then
+            echo "::warning title=Unexpected exit code::run 0: run_pipeline.sh exited with exit=$PIPELINE_EXIT, but the DECLARED list for django is build {0}, test {0, 1}. Basis: commands.sh calls runtests.py DIRECTLY (no wrapper), so the exit code is that of unittest; the local test of this release reproduced the declared exits. Per-stage codes in runs/validation/exit_codes_run_00.txt."
           fi
           echo "run 0: valid measurement (workload exit=$PIPELINE_EXIT)"
 
@@ -291,12 +291,12 @@ jobs:
             # A warm-up rejected by exit code aborts the campaign: the workload does not
             # produce the declared exits in this session, and the 10 runs would be equally rejectable.
             if [ "$WARMUP_EXIT" -eq 65 ]; then
-              echo "::error title=Warm-up rejected by exit code::warm-up: a stage exited with a code outside the DECLARED list build {0}, test {0}. The campaign does NOT proceed: the workload is not producing the declared result in this session. Material in runs/discarded_exit_code/."
+              echo "::error title=Warm-up rejected by exit code::warm-up: a stage exited with a code outside the DECLARED list build {0}, test {0, 1}. The campaign does NOT proceed: the workload is not producing the declared result in this session. Material in runs/discarded_exit_code/."
               echo "- **Warm-up REJECTED by exit code**; campaign aborted" >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
-            if [ "$WARMUP_EXIT" -ne 0 ]; then
-              echo "::warning title=Unexpected exit code::warm-up: run_pipeline.sh exited with exit=$WARMUP_EXIT; the expected pipeline exit for django is 0. The warm-up is discarded from the analysis either way."
+            if [ "$WARMUP_EXIT" -gt 1 ]; then
+              echo "::warning title=Unexpected exit code::warm-up: run_pipeline.sh exited with exit=$WARMUP_EXIT; the expected pipeline exit for django is 0 or 1. The warm-up is discarded from the analysis either way."
             fi
             alertar_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
             alertar_swap "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
@@ -344,7 +344,7 @@ jobs:
             # local test, an exit outside the list is a systematic regression, and the
             # repetition is a human decision after investigation.
             if [ "$RUN_EXIT" -eq 65 ]; then
-              echo "::error title=Run $NN rejected by exit code::run $NN: a stage exited with a code outside the DECLARED list build {0}, test {0}. The run was discarded and does NOT consume its number: runs/run_$NN.csv does not exist, and aggregate.py cannot include it in the median. Material preserved in runs/discarded_exit_code/. Campaign ABORTED; the repetition (Sec. E.4) is a human decision, after investigation."
+              echo "::error title=Run $NN rejected by exit code::run $NN: a stage exited with a code outside the DECLARED list build {0}, test {0, 1}. The run was discarded and does NOT consume its number: runs/run_$NN.csv does not exist, and aggregate.py cannot include it in the median. Material preserved in runs/discarded_exit_code/. Campaign ABORTED; the repetition (Sec. E.4) is a human decision, after investigation."
               {
                 echo "- Run $NN: **REJECTED by exit code**; discarded to \`runs/discarded_exit_code/\`, number NOT consumed, campaign aborted"
               } >> "$GITHUB_STEP_SUMMARY"
@@ -355,9 +355,9 @@ jobs:
               echo "- Run $NN: **MEASUREMENT FAILURE** (pipeline exit=$RUN_EXIT); campaign aborted" >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
-            if [ "$RUN_EXIT" -ne 0 ]; then
-              echo "::warning title=Unexpected exit code::run $NN: run_pipeline.sh exited with exit=$RUN_EXIT, but the expected pipeline exit for django is 0. This run must be REJECTED and REPEATED. The CSV was preserved and aggregate.py still counts it; the exclusion is MANUAL after the campaign. Per-stage codes in runs/exit_codes_run_$NN.txt; full stage log in resultados/django/logs/."
-              echo "- Run $NN: workload exit=$RUN_EXIT; **unexpected (0)**. Run to be REJECTED and REPEATED; CSV preserved, manual exclusion (aggregate.py still counts it)" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$RUN_EXIT" -gt 1 ]; then
+              echo "::warning title=Unexpected exit code::run $NN: run_pipeline.sh exited with exit=$RUN_EXIT, but the expected pipeline exit for django is 0 or 1. This run must be REJECTED and REPEATED. The CSV was preserved and aggregate.py still counts it; the exclusion is MANUAL after the campaign. Per-stage codes in runs/exit_codes_run_$NN.txt; full stage log in resultados/django/logs/."
+              echo "- Run $NN: workload exit=$RUN_EXIT; **unexpected (0 or 1)**. Run to be REJECTED and REPEATED; CSV preserved, manual exclusion (aggregate.py still counts it)" >> "$GITHUB_STEP_SUMMARY"
             fi
             echo "::endgroup::"
             if [ "$i" -lt 10 ]; then

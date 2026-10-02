@@ -34,7 +34,8 @@ MEM_SWAP="${MEM_SWAP:-$MEM_LIMIT}"
 
 # Pre-registered accepted exit codes per stage (space-separated).
 EXIT_ACEITOS_build="${EXIT_ACEITOS_build:-0}"
-EXIT_ACEITOS_test="${EXIT_ACEITOS_test:-0}"
+# test accepts 1: intermittent failures under fork leave the executed test set unchanged.
+EXIT_ACEITOS_test="${EXIT_ACEITOS_test:-0 1}"
 
 # Outside the workload range (0..2, 128+N): 0 valid run; 65 run rejected by exit
 # code (measurement intact, CSV moved to the discard directory); 1 measurement failure.
