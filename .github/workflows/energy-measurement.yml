@@ -1,0 +1,422 @@
+name: Energy Measurement
+run-name: Energy measurement (${{ inputs.campaign }})
+
+# Dedicated workflow that runs energy-measurement/run_pipeline.sh on a self-hosted
+# runner; no upstream workflow is modified.
+#
+# Measured cell: job `python` of .github/workflows/python_matrix.yml at tag 6.0
+# (36b5f39d9372147f0e758f590e35ee2b2bc317dd), Linux, CPython 3.14.1; the job of the HEAD campaign does not exist at this tag.
+#
+# Stages: build and test. There is no train stage: django is not an ML project.
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "validation = run 0 only (smoke test) | full = warm-up + runs 1..10 + median"
+        type: choice
+        required: true
+        default: validation
+        options:
+          - validation
+          - full
+
+jobs:
+  medicao:
+    runs-on: [self-hosted, linux]
+    env:
+      # The Actions `env` context does not expose the runner process HOME;
+      # ${{ env.HOME }} resolves to an empty string.
+      HOME_DIR: /home/maycon
+    # Per run: 120 s baseline + build ~17 s + test ~207 s + overhead, about 6 min.
+    timeout-minutes: 600
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Allow reading RAPL counters
+        run: sudo /usr/local/bin/rapl-set-readable
+
+      - name: Check RAPL availability
+        run: |
+          if [ ! -d /sys/class/powercap/intel-rapl ]; then
+            echo "RAPL not available on this runner"
+            exit 1
+          fi
+          echo "Available RAPL domains:"
+          ls /sys/class/powercap/intel-rapl/
+
+      - name: Check Docker image
+        run: |
+          if ! docker image inspect django-measurement-6.0.0 &>/dev/null; then
+            echo "Image 'django-measurement-6.0.0' not found on the runner."
+            echo "   Build it on the measurement host before dispatching this workflow:"
+            echo "   docker build -t django-measurement-6.0.0 -f energy-measurement/Dockerfile . (clone of branch release-6.0.0)"
+            exit 1
+          fi
+          echo "Docker image found."
+          docker image inspect django-measurement-6.0.0 --format '{{.Created}}'
+
+          # The same functional gates as run_pipeline.sh, repeated here so the job
+          # fails before any measurement starts.
+
+          # GATE 1: django.setup() completes under test_sqlite.
+          if ! docker run --rm --network none -w /project/tests \
+                 -e DJANGO_SETTINGS_MODULE=test_sqlite django-measurement-6.0.0 \
+                 python -c "import django; django.setup(); from django.conf import settings; assert settings.DATABASES['default']['ENGINE'].endswith('sqlite3')"; then
+            echo "In the image, django does not complete django.setup() under test_sqlite."
+            echo "   The 'test' stage would fail after measurement started. Rebuild."
+            exit 1
+          fi
+          echo "GATE 1: django.setup() complete, sqlite3 backend."
+
+          # GATE 2: interpreter of the tag cell.
+          if ! docker run --rm --network none django-measurement-6.0.0 \
+                 python -c "import sys; assert sys._is_gil_enabled() and sys.version.split()[0] == '3.14.1'"; then
+            echo "The image does not carry CPython 3.14.1 with the GIL enabled."
+            exit 1
+          fi
+          echo "GATE 2: CPython 3.14.1, GIL enabled."
+
+          # GATE 3: the wheelhouse resolves offline. --ignore-installed is required:
+          # otherwise the preinstalled /venv satisfies every requirement and an
+          # incomplete wheelhouse passes.
+          if ! docker run --rm --network none -w /project django-measurement-6.0.0 \
+                 pip install --dry-run --ignore-installed --quiet --no-index \
+                 --find-links=/wheelhouse -r tests/requirements/py3.txt; then
+            echo "The /wheelhouse of the image does not resolve offline."
+            echo "   The 'build' stage would fail under --network none. Rebuild."
+            exit 1
+          fi
+          echo "GATE 3: wheelhouse resolves offline (binary wheels only)."
+
+      - name: Validation run (run 0)
+        if: ${{ inputs.campaign == 'validation' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/django/release-6.0.0/runs"
+
+          # Must stay identical to validar_csv in the full-campaign step; functions
+          # do not cross step boundaries.
+          validar_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          # Workload failure is not measurement failure: the exit code is captured,
+          # not swallowed, so the move and the checks below still run.
+          PIPELINE_EXIT=0
+          bash "$HOME/experimentos/medicao/repositorios/django/release-6.0.0/run_pipeline.sh" 0 \
+            || PIPELINE_EXIT=$?
+
+          # Run 0 is a smoke test and leaves runs/ so the median never includes it;
+          # the CSV and its sidecars move together.
+          mkdir -p "$RESULTS_DIR/validation"
+          if [ -f "$RESULTS_DIR/run_00.csv" ]; then
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/validation/run_00.csv"
+            echo "run_00.csv moved to runs/validation/ (not counted in the results)"
+          fi
+          if [ -f "$RESULTS_DIR/exit_codes_run_00.txt" ]; then
+            mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
+                  "$RESULTS_DIR/validation/exit_codes_run_00.txt"
+            echo "exit_codes_run_00.txt moved along (CSV and sidecar kept together)"
+          fi
+          for side in temp_run_00_build.txt temp_run_00_test.txt; do
+            if [ -f "$RESULTS_DIR/$side" ]; then
+              mv -f "$RESULTS_DIR/$side" "$RESULTS_DIR/validation/$side"
+            fi
+          done
+
+          # Exit 65 (run rejected by exit code) is handled before the measurement gate:
+          # the CSV was moved to the discard directory on purpose, and validar_csv alone
+          # would misreport it as a measurement failure.
+          if [ "$PIPELINE_EXIT" -eq 65 ]; then
+            echo "::error title=Run rejected by exit code::run 0: a stage exited with a code outside the DECLARED list build {0}, test {1} for django. The measurement worked; the CSV and sidecar are preserved in runs/discarded_exit_code/, outside the official path, so aggregate.py does not reach them. VALIDATION FAILED: do not dispatch the full campaign before investigating. Per-stage detail in the sidecar; full log in resultados/django/logs/."
+            {
+              echo ""
+              echo "### Validation FAILED: run rejected by exit code"
+              echo ""
+              echo "Run 0 exited with \`exit=65\`: a stage returned a code outside the declared list \`build {0}, test {1}\`."
+              echo "The CSV is **not** in the official path; it is in \`runs/discarded_exit_code/\`."
+              echo ""
+              echo "**Do not dispatch \`campaign=full\`** before investigating."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Measurement gate: the job fails only for a missing or malformed CSV or zero
+          # energy/wall; the workload exit code does not enter this decision.
+          if ! validar_csv "$RESULTS_DIR/validation/run_00.csv"; then
+            echo "::error title=Measurement failure::run 0: CSV missing or invalid at runs/validation/run_00.csv (pipeline exit=$PIPELINE_EXIT). Energy and/or wall were not measured; this is NOT an expected workload failure."
+            exit 1
+          fi
+          if [ "$PIPELINE_EXIT" -ne 1 ]; then
+            echo "::warning title=Unexpected exit code::run 0: run_pipeline.sh exited with exit=$PIPELINE_EXIT, but the DECLARED list for django is build {0}, test {1}. Basis: commands.sh calls runtests.py DIRECTLY (no wrapper), so the exit code is that of unittest; the local test of this release reproduced the declared exits. Per-stage codes in runs/validation/exit_codes_run_00.txt."
+          fi
+          echo "run 0: valid measurement (workload exit=$PIPELINE_EXIT)"
+
+          # Non-blocking CPU capture check; source: column 14 (cpu_time_cgroup_s) when > 0.
+          awk -F, '
+            NR==1 { next }
+            ($2=="build" || $2=="test") && $7+0 > 0 {
+              if (NF >= 14 && $14+0 > 0) { cpu = $14+0; fonte = "cpu_time_cgroup_s" }
+              else                       { cpu = $8+$9; fonte = "user+sys (fallback)" }
+              r = cpu / $7
+              if (r < 0.5)
+                printf "::warning::[run 0] stage %s: cpu/wall = %.4f < 0.5 (cpu=%ss wall=%ss, source: %s)\n", $2, r, cpu, $7, fonte
+            }
+          ' "$RESULTS_DIR/validation/run_00.csv"
+          # Non-blocking paging check.
+          awk -F, -v LIMIAR="${SWAP_WARN_PAGES:-256}" '
+            NR==1 { next }
+            NF >= 13 && ($2=="build" || $2=="test") && $13+0 > LIMIAR {
+              printf "::warning::[run 0] stage %s: swap_out_pages=%s (swap_in_pages=%s, threshold %s); host paging during the measured window, run suspect due to I/O contention\n", $2, $13, $12, LIMIAR
+            }
+          ' "$RESULTS_DIR/validation/run_00.csv"
+
+      - name: Run 10 measurement runs
+        if: ${{ inputs.campaign == 'full' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/django/release-6.0.0/runs"
+          PIPELINE="$HOME/experimentos/medicao/repositorios/django/release-6.0.0/run_pipeline.sh"
+          rm -f "$RESULTS_DIR/run_00.csv"
+
+          # Append-only record of the actual execution order, which the final set does
+          # not preserve: a rejected run is repeated under the same number.
+          ORDEM="$RESULTS_DIR/execution_order.txt"
+          if [ ! -f "$ORDEM" ]; then
+            echo "# actual execution order (append-only) - run,start_utc,end_utc,exit,origin" > "$ORDEM"
+          fi
+          agora_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+          validar_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          # Non-blocking CPU capture check. Source: cpu_time_cgroup_s (column 14) when
+          # present and > 0, else user_time_s + sys_time_s. Under forkserver, test
+          # workers escape the in-container timing; the cgroup counts every process.
+          alertar_user_sys() {
+            local csv="$1" origem="$2"
+            [ -f "$csv" ] || return 0
+            awk -F, -v origem="$origem" '
+              NR==1 { next }
+              ($2=="build" || $2=="test") && $7+0 > 0 {
+                if (NF >= 14 && $14+0 > 0) { cpu = $14+0; fonte = "cpu_time_cgroup_s" }
+                else                       { cpu = $8+$9; fonte = "user+sys (fallback)" }
+                r = cpu / $7
+                if (r < 0.5)
+                  printf "::warning::[%s] stage %s: cpu/wall = %.4f < 0.5 (cpu=%ss wall=%ss, source: %s)\n", origem, $2, r, cpu, $7, fonte
+              }
+            ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          # Non-blocking paging check (columns 12/13).
+          alertar_swap() {
+            local csv="$1" origem="$2"
+            [ -f "$csv" ] || return 0
+            awk -F, -v origem="$origem" -v LIMIAR="${SWAP_WARN_PAGES:-256}" '
+              NR==1 { next }
+              NF >= 13 && ($2=="build" || $2=="test") && $13+0 > LIMIAR {
+                printf "::warning::[%s] stage %s: swap_out_pages=%s (swap_in_pages=%s, threshold %s); host paging during the measured window, run suspect due to I/O contention\n", origem, $2, $13, $12, LIMIAR
+              }
+            ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          # Discarded warm-up: 11 runs, median over the 10 valid ones.
+          PENDENTES=0
+          for i in $(seq 1 10); do
+            validar_csv "$RESULTS_DIR/run_$(printf '%02d' "$i").csv" || PENDENTES=$((PENDENTES+1))
+          done
+          if [ "$PENDENTES" -gt 0 ]; then
+            echo "::group::Warm-up (discarded from the analysis)"
+            echo "$PENDENTES pending run(s); running warm-up before the official runs"
+            mkdir -p "$RESULTS_DIR/warmup"
+            WARMUP_EXIT=0
+            T_INI=$(agora_utc)
+            bash "$PIPELINE" 0 || WARMUP_EXIT=$?
+            echo "00,$T_INI,$(agora_utc),$WARMUP_EXIT,warmup" >> "$ORDEM"
+            if [ ! -f "$RESULTS_DIR/run_00.csv" ]; then
+              echo "::error title=Measurement failure::warm-up: run_pipeline.sh (exit=$WARMUP_EXIT) did not write run_00.csv; measurement failure, not a workload failure."
+              exit 1
+            fi
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/warmup/run_warmup.csv"
+            if [ -f "$RESULTS_DIR/exit_codes_run_00.txt" ]; then
+              mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
+                    "$RESULTS_DIR/warmup/exit_codes_run_warmup.txt"
+            fi
+            for st in build test; do
+              if [ -f "$RESULTS_DIR/temp_run_00_${st}.txt" ]; then
+                mv -f "$RESULTS_DIR/temp_run_00_${st}.txt" \
+                      "$RESULTS_DIR/warmup/temp_run_warmup_${st}.txt"
+              fi
+            done
+            # A warm-up rejected by exit code aborts the campaign: the workload does not
+            # produce the declared exits in this session, and the 10 runs would be equally rejectable.
+            if [ "$WARMUP_EXIT" -eq 65 ]; then
+              echo "::error title=Warm-up rejected by exit code::warm-up: a stage exited with a code outside the DECLARED list build {0}, test {1}. The campaign does NOT proceed: the workload is not producing the declared result in this session. Material in runs/discarded_exit_code/."
+              echo "- **Warm-up REJECTED by exit code**; campaign aborted" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if [ "$WARMUP_EXIT" -ne 1 ]; then
+              echo "::warning title=Unexpected exit code::warm-up: run_pipeline.sh exited with exit=$WARMUP_EXIT; the expected pipeline exit for django is 1. The warm-up is discarded from the analysis either way."
+            fi
+            alertar_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+            alertar_swap "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+            {
+              echo "## Warm-up executed and DISCARDED (not part of the median)"
+              echo "- $PENDENTES pending run(s) in this session; CSV in \`runs/warmup/run_warmup.csv\` (overwritten each session)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            echo "Post-warm-up rest (120s)..."
+            sleep 120
+          else
+            echo "Campaign already complete (10 valid runs); warm-up not needed"
+            echo "## Warm-up skipped; campaign was already complete" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "## Execution (full mode), skip-if-exists" >> "$GITHUB_STEP_SUMMARY"
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            CSV="$RESULTS_DIR/run_${NN}.csv"
+            echo "::group::Run $i of 10"
+            if validar_csv "$CSV"; then
+              echo "Run $NN already exists and is valid; skipping"
+              echo "- Run $NN: already exists and is valid; **skipped**" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              continue
+            fi
+            if [ -f "$CSV" ]; then
+              echo "Run $NN incomplete/invalid; rerunning (overwrites)"
+              echo "- Run $NN: invalid/incomplete CSV; **rerun**" >> "$GITHUB_STEP_SUMMARY"
+              rm -f "$CSV"
+            else
+              echo "Run $NN missing; running"
+              echo "- Run $NN: missing; **executed**" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            # A nonzero workload exit is tolerated here: captured, not swallowed, and
+            # recorded per stage in the exit_codes_run_NN.txt sidecar.
+            RUN_EXIT=0
+            T_INI=$(agora_utc)
+            bash "$PIPELINE" "$i" || RUN_EXIT=$?
+            echo "$NN,$T_INI,$(agora_utc),$RUN_EXIT,campaign" >> "$ORDEM"
+            alertar_user_sys "$CSV" "run $NN"
+            alertar_swap "$CSV" "run $NN"
+            # Handled before the measurement gate, as in validation mode. The campaign
+            # aborts instead of repeating automatically: with the declared exits and a green
+            # local test, an exit outside the list is a systematic regression, and the
+            # repetition is a human decision after investigation.
+            if [ "$RUN_EXIT" -eq 65 ]; then
+              echo "::error title=Run $NN rejected by exit code::run $NN: a stage exited with a code outside the DECLARED list build {0}, test {1}. The run was discarded and does NOT consume its number: runs/run_$NN.csv does not exist, and aggregate.py cannot include it in the median. Material preserved in runs/discarded_exit_code/. Campaign ABORTED; the repetition (Sec. E.4) is a human decision, after investigation."
+              {
+                echo "- Run $NN: **REJECTED by exit code**; discarded to \`runs/discarded_exit_code/\`, number NOT consumed, campaign aborted"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if ! validar_csv "$CSV"; then
+              echo "::error title=Measurement failure::run $NN: CSV missing or invalid after the pipeline (exit=$RUN_EXIT). Energy and/or wall were not measured; campaign aborted."
+              echo "- Run $NN: **MEASUREMENT FAILURE** (pipeline exit=$RUN_EXIT); campaign aborted" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if [ "$RUN_EXIT" -ne 1 ]; then
+              echo "::warning title=Unexpected exit code::run $NN: run_pipeline.sh exited with exit=$RUN_EXIT, but the expected pipeline exit for django is 1. This run must be REJECTED and REPEATED. The CSV was preserved and aggregate.py still counts it; the exclusion is MANUAL after the campaign. Per-stage codes in runs/exit_codes_run_$NN.txt; full stage log in resultados/django/logs/."
+              echo "- Run $NN: workload exit=$RUN_EXIT; **unexpected (1)**. Run to be REJECTED and REPEATED; CSV preserved, manual exclusion (aggregate.py still counts it)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::endgroup::"
+            if [ "$i" -lt 10 ]; then
+              echo "Rest between runs (120s)..."
+              sleep 120
+            fi
+          done
+
+          # Final sweep: also covers pre-existing runs skipped by skip-if-exists.
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            alertar_user_sys "$RESULTS_DIR/run_${NN}.csv" "run $NN"
+            alertar_swap "$RESULTS_DIR/run_${NN}.csv" "run $NN"
+          done
+
+          # Explicit precondition of the median step: an invalid CSV in a skipped run
+          # would otherwise yield a median over fewer than 10 runs.
+          INVALIDAS=""
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            validar_csv "$RESULTS_DIR/run_${NN}.csv" || INVALIDAS="${INVALIDAS:+$INVALIDAS }$NN"
+          done
+          if [ -n "$INVALIDAS" ]; then
+            echo "::error title=Incomplete campaign::runs with missing or invalid CSV: $INVALIDAS; medians will NOT be computed."
+            echo "- **Incomplete campaign**; invalid runs: $INVALIDAS" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "10 runs with a valid CSV; aggregate.py precondition satisfied"
+
+      - name: Compute medians (after run 10)
+        if: ${{ inputs.campaign == 'full' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/django/release-6.0.0/runs"
+          SUMMARY="$HOME/experimentos/medicao/resultados/django/release-6.0.0/summary.csv"
+          python3 "$HOME/experimentos/medicao/scripts/aggregate.py" "$RESULTS_DIR" "$SUMMARY"
+          {
+            echo ""
+            echo "## Medians (10 runs) - django"
+            echo '```'
+            cat "$SUMMARY"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Docker --privileged leaves root-owned files in the workspace; ownership is
+      # restored through a throwaway container, without sudo on the runner.
+      - name: Fix workspace permissions
+        if: always()
+        run: |
+          docker run --rm --privileged \
+            -v "${{ github.workspace }}":/w \
+            alpine chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-django-6.0.0-${{ github.run_number }}
+          # Internal reference notes stay out of the artifact.
+          path: |
+            ${{ env.HOME_DIR }}/experimentos/medicao/resultados/django/release-6.0.0/
+            !${{ env.HOME_DIR }}/experimentos/medicao/resultados/django/release-6.0.0/NOTA_FIDELIDADE*.md
+          retention-days: 90
