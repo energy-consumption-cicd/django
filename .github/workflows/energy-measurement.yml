@@ -1,4 +1,4 @@
-name: Medição de Energia — django
+name: Energy Measurement
 
 # Opção C: workflow dedicado que invoca o run_pipeline.sh da tesla, rodando no
 # self-hosted runner. Não substitui nem altera nenhum workflow do django.
